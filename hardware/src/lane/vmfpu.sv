@@ -9,19 +9,22 @@
 
 module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
   import cf_math_pkg::idx_width; #(
-    parameter  int           unsigned NrLanes      = 0,
+    parameter  int           unsigned NrLanes         = 0,
+    parameter  int           unsigned VLEN            = 0,
     // Support for floating-point data types
-    parameter  fpu_support_e          FPUSupport   = FPUSupportHalfSingleDouble,
+    parameter  fpu_support_e          FPUSupport      = FPUSupportHalfSingleDouble,
     // External support for vfrec7, vfrsqrt7, rounding-toward-odd
-    parameter  fpext_support_e        FPExtSupport = FPExtSupportEnable,
+    parameter  fpext_support_e        FPExtSupport    = FPExtSupportEnable,
     // Support for fixed-point data types
-    parameter  fixpt_support_e        FixPtSupport = FixedPointEnable,
+    parameter  fixpt_support_e        FixPtSupport    = FixedPointEnable,
     // Type used to address vector register file elements
-    parameter  type                   vaddr_t      = logic,
+    parameter  type                   vaddr_t         = logic,
+    parameter  type                   vfu_operation_t = logic,
     // Dependant parameters. DO NOT CHANGE!
     localparam int           unsigned DataWidth    = $bits(elen_t),
     localparam int           unsigned StrbWidth    = DataWidth/8,
-    localparam type                   strb_t       = logic [DataWidth/8-1:0]
+    localparam type                   strb_t       = logic [DataWidth/8-1:0],
+    localparam type                   vlen_t       = logic[$clog2(VLEN+1)-1:0]
   ) (
     input  logic                         clk_i,
     input  logic                         rst_ni,
@@ -721,6 +724,50 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
       15: reduction_rx_cnt_init = reduction_rx_cnt_t'(4);
     endcase
   endfunction: reduction_rx_cnt_init
+
+  ////////////////////////////////
+  //  Floating-point conversion //
+  ////////////////////////////////
+
+  logic [$clog2(fp_mantissa_bits(EW16, 0))-1:0] fp16_m_lzc[2]; // 4 bits each
+  logic [$clog2(fp_mantissa_bits(EW32, 0))-1:0] fp32_m_lzc;    // 5 bits each
+
+  fp16_t fp16[2];
+  fp32_t fp32;
+
+  // To convert subnormal numbers to normalized form in floating-point numbers,
+  // it is necessary to determine the number of leading zeros in the mantissa.
+  // This is typically accomplished using a lzc (leading zero count) module,
+  // which can accurately count the number of leading zeros in a given number.
+  // By knowing the number of leading zeros in the mantissa, we can properly
+  // adjust the exponent and shift the binary point to achieve a normalized
+  // representation of the number.
+  if ({RVVH(FPUSupport), RVVF(FPUSupport)} == 2'b11) begin
+    // sew: 16-bit
+    for (genvar i = 0; i < 2; i++) begin
+      lzc #(
+        .WIDTH(fp_mantissa_bits(EW16, 0)),
+        .MODE (1)
+      ) leading_zero_e16_i (
+        .in_i   (fp16[i].m    ),
+        .cnt_o  (fp16_m_lzc[i]),
+        .empty_o(/*Unused*/   )
+      );
+    end
+  end
+
+  if ({RVVF(FPUSupport), RVVD(FPUSupport)} == 2'b11) begin
+    // sew: 32-bit
+    lzc #(
+       .WIDTH(fp_mantissa_bits(EW32, 0)),
+       .MODE (1)
+     ) leading_zero_e32 (
+       .in_i   (fp32.m    ),
+       .cnt_o  (fp32_m_lzc),
+       .empty_o(/*Unused*/)
+     );
+  end
+
   ///////////
   //  FPU  //
   ///////////
@@ -1313,8 +1360,14 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
     // fpnew allows out-of-order execution and different instruction
     // types have different latencies. We have to enforce in-order execution.
     // If we are about to issue an instruction while another one is processing,
-    // issue only if the new instruction is slower than the previous one
-    latency_problem_d = vinsn_issue_lat_d < vinsn_processing_lat_d;
+    // issue only if the new instruction is slower than the previous one.
+    // VFDIV-like instructions have variable latency, so stall them not to create
+    // problems.
+    latency_problem_d = (vinsn_issue_lat_d < vinsn_processing_lat_d)            ||
+                        (((vinsn_issue_d.op    inside {VFDIV, VFRDIV, VFSQRT})  ||
+                        (vinsn_processing_d.op inside {VFDIV, VFRDIV, VFSQRT})) &&
+                        vinsn_issue_d.id != vinsn_processing_d.id);
+
     latency_stall     = vinsn_issue_q_valid & vinsn_processing_q_valid & latency_problem_q;
 
     operand_a = (vinsn_issue_q.op == VFRDIV) ? scalar_op : mfpu_operand_i[1]; // vs2
@@ -1338,6 +1391,9 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
     operands_ready = vinsn_issue_q.swap_vs2_vd_op
                    ? {vinsn_issue_q.use_vs2, vinsn_issue_q.use_vd_op, vinsn_issue_q.use_vs1}
                    : {vinsn_issue_q.use_vd_op, vinsn_issue_q.use_vs2, vinsn_issue_q.use_vs1};
+
+    for (int i = 0; i < 2; i++) fp16[i] = '0;
+    for (int i = 0; i < 1; i++) fp32[i] = '0;
 
     first_op_d              = first_op_q;
     simd_red_cnt_d          = simd_red_cnt_q;
@@ -1519,7 +1575,7 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
 
           // Store the result in the result queue
           result_queue_d[result_queue_write_pnt_q].id    = vinsn_processing_q.id;
-          result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes) +
+          result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes, VLEN) +
             ((vinsn_processing_q.vl - to_process_cnt_q) >> (int'(EW64) - vinsn_processing_q.vtype.vsew));
           // FP narrowing instructions pack the result in two different cycles, and only some 16-bit slices are active
           if (narrowing(vinsn_processing_q.cvt_resize)) begin
@@ -1619,7 +1675,7 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
               to_process_cnt_d = to_process_cnt_q - processed_element_cnt;
 
             result_queue_d[result_queue_write_pnt_q].wdata = vfpu_processed_result;
-            result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes);
+            result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes, VLEN);
             result_queue_d[result_queue_write_pnt_q].id    = vinsn_processing_q.id;
             result_queue_d[result_queue_write_pnt_q].be    = be(1, vinsn_processing_q.vtype.vsew);
             result_queue_valid_d[result_queue_write_pnt_q] = 1'b1;
@@ -1974,7 +2030,7 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
           mfpu_state_d = MFPU_WAIT;
         end else if ((lane_id_i == '0) && sldu_mfpu_valid_q && to_process_cnt_d == '0) begin
           // Lane 0 should wait for the final result
-          result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes);
+          result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_processing_q.vd, NrLanes, VLEN);
           result_queue_d[result_queue_write_pnt_q].id    = vinsn_processing_q.id;
           result_queue_d[result_queue_write_pnt_q].be    = be(1, vinsn_processing_q.vtype.vsew);
           result_queue_d[result_queue_write_pnt_q].mask  = vinsn_processing_q.vfu == VFU_MaskUnit;
@@ -2162,24 +2218,15 @@ module vmfpu import ara_pkg::*; import rvv_pkg::*; import fpnew_pkg::*;
             RVVD(FPUSupport)})
             {EW32, 1'b1, 1'b1, 1'b?}: begin
               for (int e = 0; e < 2; e++) begin
-                automatic fp16_t fp16 =
-                  vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[15:0];
-                automatic fp32_t fp32;
-                fp32.s = fp16.s;
-                fp32.e = (fp16.e - 15) + 127;
-                fp32.m = {fp16.m, 13'b0};
-
-                vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[32*e +: 32] = fp32;
+                fp16[e] = vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[15:0];
+                vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[32*e +: 32] =
+                  fp32_from_fp16(fp16[e], fp16_m_lzc[e]);
               end
             end
             {EW64, 1'b?, 1'b1, 1'b1}: begin
-              automatic fp32_t fp32 = vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[31:0];
-              automatic fp64_t fp64;
-              fp64.s = fp32.s;
-              fp64.e = (fp32.e - 127) + 1023;
-              fp64.m = {fp32.m, 29'b0};
-
-              vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op = fp64;
+              fp32 = vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op[31:0];
+              vinsn_queue_d.vinsn[vinsn_queue_q.accept_pnt].scalar_op =
+                fp64_from_fp32(fp32, fp32_m_lzc);
             end
             default:;
           endcase

@@ -3,10 +3,12 @@
 # Matrix sizes
 def_args_imatmul     ?= "128 128 128"
 def_args_fmatmul     ?= "128 128 128"
+def_args_dtype-matmul?= "float64 128 128 128"
 # Matrix size, filter size
 def_args_iconv2d     ?= "112 7"
 def_args_fconv2d     ?= "112 7"
 def_args_fconv3d     ?= "112 7"
+def_args_dtype-conv3d?= "112 7 float64"
 # Vector size
 def_args_fdotproduct ?= "512"
 # Vector size

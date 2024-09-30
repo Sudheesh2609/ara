@@ -9,6 +9,7 @@
 module ara_soc import axi_pkg::*; import ara_pkg::*; #(
     // RVV Parameters
     parameter  int           unsigned NrLanes      = 0,                          // Number of parallel vector lanes.
+    parameter  int           unsigned VLEN         = 0,                          // VLEN [bit]
     // Support for floating-point data types
     parameter  fpu_support_e          FPUSupport   = FPUSupportHalfSingleDouble,
     // External support for vfrec7, vfrsqrt7
@@ -23,7 +24,7 @@ module ara_soc import axi_pkg::*; import ara_pkg::*; #(
     // AXI Resp Delay [ps] for gate-level simulation
     parameter  int           unsigned AxiRespDelay = 200,
     // Main memory
-    parameter  int           unsigned L2NumWords   = 2**20,
+    parameter  int           unsigned L2NumWords   = (2**22) / NrLanes,
     // Dependant parameters. DO NOT CHANGE!
     localparam type                   axi_data_t   = logic [AxiDataWidth-1:0],
     localparam type                   axi_strb_t   = logic [AxiDataWidth/8-1:0],
@@ -139,7 +140,8 @@ module ara_soc import axi_pkg::*; import ara_pkg::*; #(
     UniqueIds         : 1'b0,
     AxiAddrWidth      : AxiAddrWidth,
     AxiDataWidth      : AxiWideDataWidth,
-    NoAddrRules       : NrAXISlaves
+    NoAddrRules       : NrAXISlaves,
+    default           : '0
   };
 
   axi_pkg::xbar_rule_64_t [NrAXISlaves-1:0] routing_rules;
@@ -492,8 +494,8 @@ module ara_soc import axi_pkg::*; import ara_pkg::*; #(
     CLICNumInterruptSrc   : 0,
     // idempotent region
     NrNonIdempotentRules : 2,
-    NonIdempotentAddrBase: {64'b0, 64'b0},
-    NonIdempotentLength  : {64'b0, 64'b0},
+    NonIdempotentAddrBase: {UARTBase, CTRLBase},
+    NonIdempotentLength  : {UARTLength, CTRLLength},
     NrExecuteRegionRules : 3,
     //                      DRAM,       Boot ROM,   Debug Module
     ExecuteRegionAddrBase: {DRAMBase, 64'h1_0000, 64'h0},
@@ -511,6 +513,7 @@ module ara_soc import axi_pkg::*; import ara_pkg::*; #(
 `ifndef TARGET_GATESIM
   ara_system #(
     .NrLanes           (NrLanes              ),
+    .VLEN              (VLEN                 ),
     .FPUSupport        (FPUSupport           ),
     .FPExtSupport      (FPExtSupport         ),
     .FixPtSupport      (FixPtSupport         ),

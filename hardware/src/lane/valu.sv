@@ -8,15 +8,18 @@
 // in a SIMD fashion, always operating on 64 bits.
 
 module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width; #(
-    parameter  int    unsigned NrLanes      = 0,
+    parameter  int    unsigned NrLanes         = 0,
+    parameter  int    unsigned VLEN            = 0,
     // Support for fixed-point data types
-    parameter  fixpt_support_e FixPtSupport = FixedPointEnable,
+    parameter  fixpt_support_e FixPtSupport    = FixedPointEnable,
     // Type used to address vector register file elements
-    parameter  type            vaddr_t      = logic,
+    parameter  type            vaddr_t         = logic,
+    parameter  type            vfu_operation_t = logic,
     // Dependant parameters. DO NOT CHANGE!
     localparam int    unsigned DataWidth    = $bits(elen_t),
     localparam int    unsigned StrbWidth    = DataWidth/8,
-    localparam type            strb_t       = logic [StrbWidth-1:0]
+    localparam type            strb_t       = logic [StrbWidth-1:0],
+    localparam type            vlen_t       = logic[$clog2(VLEN+1)-1:0]
   ) (
     input  logic                         clk_i,
     input  logic                         rst_ni,
@@ -449,7 +452,8 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
                 (alu_operand_valid_i[0] || !vinsn_issue_q.use_vs1) &&
                 (mask_valid_i || vinsn_issue_q.vm)) begin
               // How many elements are we committing with this word?
-              automatic logic [3:0] element_cnt = (1 << (int'(EW64) - int'(vinsn_issue_q.vtype.vsew)));
+              automatic logic [3:0] element_cnt = (1 << (unsigned'(EW64) - unsigned'(vinsn_issue_q.vtype.vsew)));
+
               if (element_cnt > issue_cnt_q)
                 element_cnt = issue_cnt_q;
 
@@ -465,7 +469,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
 
               // Store the result in the result queue
               result_queue_d[result_queue_write_pnt_q].wdata = result_queue_q[result_queue_write_pnt_q].wdata | valu_result;
-              result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_issue_q.vd, NrLanes) + ((vinsn_issue_q.vl - issue_cnt_q) >> (int'(EW64) - vinsn_issue_q.vtype.vsew));
+              result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_issue_q.vd, NrLanes, VLEN) + ((vinsn_issue_q.vl - issue_cnt_q) >> (unsigned'(EW64) - unsigned'(vinsn_issue_q.vtype.vsew)));
               result_queue_d[result_queue_write_pnt_q].id    = vinsn_issue_q.id;
               result_queue_d[result_queue_write_pnt_q].mask  = vinsn_issue_q.vfu == VFU_MaskUnit;
               if (!narrowing(vinsn_issue_q.op) || !narrowing_select_q)
@@ -474,7 +478,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
               // Is this a narrowing instruction?
               if (narrowing(vinsn_issue_q.op)) begin
                 // How many elements did we calculate in this iteration?
-                automatic logic [3:0] element_cnt_narrow = (1 << (int'(EW64) - int'(vinsn_issue_q.vtype.vsew))) / 2;
+                automatic logic [3:0] element_cnt_narrow = (1 << (unsigned'(EW64) - unsigned'(vinsn_issue_q.vtype.vsew))) / 2;
                 if (element_cnt_narrow > issue_cnt_q)
                   element_cnt_narrow = issue_cnt_q;
 
@@ -526,6 +530,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
                   if (!(vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].op inside {[VMANDNOT:VMXNOR]}))
                     issue_cnt_d = vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl;
                   else begin
+                    $warning("vstart was never tested for op inside {[VMANDNOT:VMXNOR]}");
                     issue_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl / 8) >>
                       vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vtype.vsew;
                     issue_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl[2:0];
@@ -547,7 +552,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
                 (alu_operand_valid_i[0] || !vinsn_issue_q.use_vs1 || !first_op_q) &&
                 (mask_valid_i || vinsn_issue_q.vm)) begin
               // How many elements are we committing with this word?
-              automatic logic [3:0] element_cnt = (1 << (int'(EW64) - int'(vinsn_issue_q.vtype.vsew)));
+              automatic logic [3:0] element_cnt = (1 << (unsigned'(EW64) - unsigned'(vinsn_issue_q.vtype.vsew)));
               if (element_cnt > issue_cnt_q)
                 element_cnt = issue_cnt_q;
 
@@ -569,7 +574,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
                     valu_result[8*b +: 8]  :
                     alu_operand_a[8*b +: 8];
               end
-              result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_issue_q.vd, NrLanes);
+              result_queue_d[result_queue_write_pnt_q].addr  = vaddr(vinsn_issue_q.vd, NrLanes, VLEN);
               result_queue_d[result_queue_write_pnt_q].id    = vinsn_issue_q.id;
               result_queue_d[result_queue_write_pnt_q].be    = be(1, vinsn_issue_q.vtype.vsew);
 
@@ -657,6 +662,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
             if (!(vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].op inside {[VMANDNOT:VMXNOR]}))
               issue_cnt_d = vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl;
             else begin
+              $warning("vstart was never tested for op inside {[VMANDNOT:VMXNOR]}");
               issue_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl / 8) >>
                 vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vtype.vsew;
               issue_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl[2:0];
@@ -693,6 +699,7 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
                 if (!(vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].op inside {[VMANDNOT:VMXNOR]}))
                   issue_cnt_d = vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl;
                 else begin
+                  $warning("vstart was never tested for op inside {[VMANDNOT:VMXNOR]}");
                   issue_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl / 8) >>
                     vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vtype.vsew;
                   issue_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.issue_pnt].vl[2:0];
@@ -750,8 +757,8 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
       // Decrement the counter of remaining vector elements waiting to be written
       // Don't do it in case of a reduction
       if (!is_reduction(vinsn_commit.op))
-        commit_cnt_d = commit_cnt_q - (1 << (int'(EW64) - vinsn_commit.vtype.vsew));
-      if (commit_cnt_q < (1 << (int'(EW64) - vinsn_commit.vtype.vsew))) commit_cnt_d = '0;
+        commit_cnt_d = commit_cnt_q - (1 << (unsigned'(EW64) - vinsn_commit.vtype.vsew));
+      if (commit_cnt_q < (1 << (unsigned'(EW64) - vinsn_commit.vtype.vsew))) commit_cnt_d = '0;
     end
 
     // Finished committing the results of a vector instruction
@@ -765,16 +772,18 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
       else vinsn_queue_d.commit_pnt += 1;
 
       // Update the commit counter for the next instruction
-      if (vinsn_queue_d.commit_cnt != '0)
+      if (vinsn_queue_d.commit_cnt != '0) begin
         if (!(vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].op inside {[VMANDNOT:VMXNOR]}))
           commit_cnt_d = vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vl;
         else begin
           // We are asking for bits, and we want at least one chunk of bits if
           // vl > 0. Therefore, commit_cnt = ceil((vl / 8) >> sew)
+          $warning("vstart was never tested for op inside {[VMANDNOT:VMXNOR]}");
           commit_cnt_d = (vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vl / 8) >>
             vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vtype.vsew;
           commit_cnt_d += |vinsn_queue_q.vinsn[vinsn_queue_d.commit_pnt].vl[2:0];
         end
+      end
 
       // Initialize counters and alu state if needed by the next instruction
       // After a reduction, the next instructions starts after the reduction commits
@@ -804,7 +813,9 @@ module valu import ara_pkg::*; import rvv_pkg::*; import cf_math_pkg::idx_width;
       // Initialize counters and alu state if the instruction queue was empty
       // and the lane is not reducing
       if ((vinsn_queue_d.issue_cnt == '0) && !prevent_commit) begin
-        alu_state_d = is_reduction(vfu_operation_i.op) ? INTRA_LANE_REDUCTION : NO_REDUCTION;
+        // INTRA_LANE_REDUCTION state needs the result queue
+        // Start the reduction only if the commit queue (so, the result queue, too) is empty
+        alu_state_d = is_reduction(vfu_operation_i.op) && (vinsn_queue_d.commit_cnt == '0) ? INTRA_LANE_REDUCTION : NO_REDUCTION;
         // The next will be the first operation of this instruction
         // This information is useful for reduction operation
         // Initialize reduction-related sequential elements

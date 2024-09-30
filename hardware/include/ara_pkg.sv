@@ -17,12 +17,6 @@ package ara_pkg;
   localparam int unsigned ELEN  = 64;
   // Maximum size of a single vector element, in bytes.
   localparam int unsigned ELENB = ELEN / 8;
-  // Number of bits in a vector register.
-  localparam int unsigned VLEN  = `ifdef VLEN `VLEN `else 0 `endif;
-  // Number of bytes in a vector register.
-  localparam int unsigned VLENB = VLEN / 8;
-  // Maximum vector length (in elements).
-  localparam int unsigned MAXVL = VLEN; // SEW = EW8, LMUL = 8. VL = 8 * VLEN / 8 = VLEN.
 
   // Number of vector instructions that can run in parallel.
   localparam int unsigned NrVInsn = 8;
@@ -105,7 +99,6 @@ package ara_pkg;
   //  Definitions  //
   ///////////////////
 
-  typedef logic [$clog2(MAXVL+1)-1:0] vlen_t;
   typedef logic [$clog2(NrVInsn)-1:0] vid_t;
   typedef logic [ELEN-1:0] elen_t;
 
@@ -157,17 +150,17 @@ package ara_pkg;
   } ara_op_e;
 
   // Return true if op is a load operation
-  function automatic is_load(ara_op_e op);
+  function automatic logic is_load(ara_op_e op);
     is_load = op inside {[VLE:VLXE]};
   endfunction : is_load
 
   // Return true if op is a store operation
-  function automatic is_store(ara_op_e op);
+  function automatic logic is_store(ara_op_e op);
     is_store = op inside {[VSE:VSXE]};
   endfunction : is_store
 
   // Return true of op is either VCPOP or VFIRST
-  function automatic vd_scalar(ara_op_e op);
+  function automatic logic vd_scalar(ara_op_e op);
     vd_scalar = op inside {[VCPOP:VFIRST]};
   endfunction : vd_scalar
 
@@ -236,100 +229,77 @@ package ara_pkg;
     logic [51:0] m;
   } fp64_t;
 
+  function automatic int unsigned fp_mantissa_bits(rvv_pkg::vew_e fp_dtype, logic is_alt);
+    unique case ({fp_dtype, is_alt})
+      {rvv_pkg::EW8,  1'b0}: fp_mantissa_bits = 2;
+      {rvv_pkg::EW8,  1'b1}: fp_mantissa_bits = 3;
+      {rvv_pkg::EW16, 1'b0}: fp_mantissa_bits = 10;
+      {rvv_pkg::EW16, 1'b1}: fp_mantissa_bits = 7;
+      {rvv_pkg::EW32, 1'b0}: fp_mantissa_bits = 23;
+      {rvv_pkg::EW64, 1'b0}: fp_mantissa_bits = 52;
+      default: fp_mantissa_bits = -1;
+    endcase
+  endfunction
+
+  function automatic fp32_t fp32_from_fp16(fp16_t fp16, logic [$clog2(fp_mantissa_bits(rvv_pkg::EW16, 0)):0] fp16_m_lzc);
+    automatic fp16_t fp16_temp;
+    automatic fp32_t fp32;
+
+    // Wide sign
+    fp32.s = fp16.s;
+
+    // Wide exponent
+    // 127 - 15 = 112
+    unique case(fp16.e)
+      '0:      fp32.e = (fp16.m == '0) ? '0 : 8'd112 - {4'd0, fp16_m_lzc}; // Zero or Subnormal
+      '1:      fp32.e = '1; // NaN
+      default: fp32.e = 8'd112 + {3'd0, fp16.e}; // Normal
+    endcase
+
+    // Wide mantissa
+    // If the input is NaN, output a quiet NaN mantissa.
+    // Otherwise, append trailing zeros to the mantissa.
+    fp16_temp.m = ((fp16.e == '0) && (fp16.m != '0)) ? (fp16.m << 1) << fp16_m_lzc : fp16.m;
+    fp32.m = ((fp16.e == '1) && (fp16.m != '0) ) ? {1'b1, 22'b0} : {fp16_temp.m, 13'b0};
+
+    fp32_from_fp16 = fp32;
+  endfunction
+
+  function automatic fp64_t fp64_from_fp32(fp32_t fp32, logic [$clog2(fp_mantissa_bits(rvv_pkg::EW32, 0)):0] fp32_m_lzc);
+    automatic fp32_t fp32_temp;
+    automatic fp64_t fp64;
+
+    // Wide sign
+    fp64.s = fp32.s;
+
+    // Wide exponent
+    // 1023 - 127 = 896
+    unique case(fp32.e)
+      '0:      fp64.e = (fp32.m == '0) ? '0 : 11'd896 - {6'd0, fp32_m_lzc}; // Zero or Subnormal
+      '1:      fp64.e = '1; // NaN
+      default: fp64.e = 11'd896 + {3'd0, fp32.e}; // Normal
+    endcase
+
+    // Wide mantissa
+    // If the input is NaN, output a quiet NaN mantissa.
+    // Otherwise, append trailing zeros to the mantissa.
+    fp32_temp.m = ((fp32.e == '0) && (fp32.m != '0)) ? (fp32.m << 1) << fp32_m_lzc : fp32.m;
+    fp64.m = ((fp32.e == '1) && (fp32.m != '0)) ? {1'b1, 51'b0} : {fp32_temp.m, 29'b0};
+
+    fp64_from_fp32 = fp64;
+  endfunction
+
   /////////////////////////////
   //  Accelerator interface  //
   /////////////////////////////
 
   // Use Ariane's accelerator interface.
+  typedef acc_pkg::cva6_to_acc_t cva6_to_acc_t;
+  typedef acc_pkg::acc_to_cva6_t acc_to_cva6_t;
   typedef acc_pkg::accelerator_req_t accelerator_req_t;
   typedef acc_pkg::accelerator_resp_t accelerator_resp_t;
-
-  /////////////////////////
-  //  Backend interface  //
-  /////////////////////////
-
-  // Interfaces between Ara's dispatcher and Ara's backend
-
-  typedef struct packed {
-    ara_op_e op; // Operation
-
-    // Stores and slides do not re-shuffle the
-    // source registers. In these two cases, vl refers
-    // to the target EEW and vtype.vsew, respectively.
-    // Since operand requesters work with the old
-    // eew of the source registers, we should rescale
-    // vl to the old eew to fetch the correct number of Bytes.
-    //
-    // Another solution would be to pass directly the target
-    // eew (vstores) or the vtype.vsew (vslides), but this would
-    // create confusion with the current naming convention
-    logic scale_vl;
-
-    // Mask vector register operand
-    logic vm;
-    rvv_pkg::vew_e eew_vmask;
-
-    // 1st vector register operand
-    logic [4:0] vs1;
-    logic use_vs1;
-    opqueue_conversion_e conversion_vs1;
-    rvv_pkg::vew_e eew_vs1;
-
-    // 2nd vector register operand
-    logic [4:0] vs2;
-    logic use_vs2;
-    opqueue_conversion_e conversion_vs2;
-    rvv_pkg::vew_e eew_vs2;
-
-    // Use vd as an operand as well (e.g., vmacc)
-    logic use_vd_op;
-    rvv_pkg::vew_e eew_vd_op;
-
-    // Scalar operand
-    elen_t scalar_op;
-    logic use_scalar_op;
-
-    // 2nd scalar operand: stride for constant-strided vector load/stores, slide offset for vector
-    // slides
-    elen_t stride;
-    logic is_stride_np2;
-
-    // Destination vector register
-    logic [4:0] vd;
-    logic use_vd;
-
-    // If asserted: vs2 is kept in MulFPU opqueue C, and vd_op in MulFPU A
-    logic swap_vs2_vd_op;
-
-    // Effective length multiplier
-    rvv_pkg::vlmul_e emul;
-
-    // Rounding-Mode for FP operations
-    fpnew_pkg::roundmode_e fp_rm;
-    // Widen FP immediate (re-encoding)
-    logic wide_fp_imm;
-    // Resizing of FP conversions
-    resize_e cvt_resize;
-
-    // Vector machine metadata
-    vlen_t vl;
-    vlen_t vstart;
-    rvv_pkg::vtype_t vtype;
-
-    // Request token, for registration in the sequencer
-    logic token;
-  } ara_req_t;
-
-  typedef struct packed {
-    // Scalar response
-    elen_t resp;
-
-    // Instruction triggered an error
-    logic error;
-
-    // New value for vstart
-    vlen_t error_vl;
-  } ara_resp_t;
+  typedef acc_pkg::acc_mmu_req_t acc_mmu_req_t;
+  typedef acc_pkg::acc_mmu_resp_t acc_mmu_resp_t;
 
   ////////////////////
   //  PE interface  //
@@ -354,78 +324,6 @@ package ara_pkg;
     OffsetLoad, OffsetStore, OffsetMask, OffsetSlide
   } vfu_offset_e;
 
-  typedef struct packed {
-    vid_t id; // ID of the vector instruction
-
-    ara_op_e op; // Operation
-
-    // Mask vector register operand
-    logic vm;
-    rvv_pkg::vew_e eew_vmask;
-
-    vfu_e vfu; // VFU responsible for handling this instruction
-
-    // Rescale vl taking into account the new and old EEW
-    logic scale_vl;
-
-    // 1st vector register operand
-    logic [4:0] vs1;
-    logic use_vs1;
-    opqueue_conversion_e conversion_vs1;
-    rvv_pkg::vew_e eew_vs1;
-
-    // 2nd vector register operand
-    logic [4:0] vs2;
-    logic use_vs2;
-    opqueue_conversion_e conversion_vs2;
-    rvv_pkg::vew_e eew_vs2;
-
-    // Use vd as an operand as well (e.g., vmacc)
-    logic use_vd_op;
-    rvv_pkg::vew_e eew_vd_op;
-
-    // Scalar operand
-    elen_t scalar_op;
-    logic use_scalar_op;
-
-    // If asserted: vs2 is kept in MulFPU opqueue C, and vd_op in MulFPU A
-    logic swap_vs2_vd_op;
-
-    // 2nd scalar operand: stride for constant-strided vector load/stores
-    elen_t stride;
-    logic is_stride_np2;
-
-    // Destination vector register
-    logic [4:0] vd;
-    logic use_vd;
-
-    // Effective length multiplier
-    rvv_pkg::vlmul_e emul;
-
-    // Rounding-Mode for FP operations
-    fpnew_pkg::roundmode_e fp_rm;
-    // Widen FP immediate (re-encoding)
-    logic wide_fp_imm;
-    // Resizing of FP conversions
-    resize_e cvt_resize;
-
-    // Vector machine metadata
-    vlen_t vl;
-    vlen_t vstart;
-    rvv_pkg::vtype_t vtype;
-
-    // Hazards
-    logic [NrVInsn-1:0] hazard_vs1;
-    logic [NrVInsn-1:0] hazard_vs2;
-    logic [NrVInsn-1:0] hazard_vm;
-    logic [NrVInsn-1:0] hazard_vd;
-  } pe_req_t;
-
-  typedef struct packed {
-    // Each set bit indicates that the corresponding vector loop has finished execution
-    logic [NrVInsn-1:0] vinsn_done;
-  } pe_resp_t;
-
   /* The VRF data is stored into the lanes in a shuffled way, similar to how it was done
    * in version 0.9 of the RISC-V Vector Specification, when SLEN < VLEN. In fact, VRF
    * data is organized in lanes as in section 4.3 of the RVV Specification v0.9, with
@@ -448,36 +346,36 @@ package ara_pkg;
    * packing) functions.
    */
 
-  function automatic vlen_t shuffle_index(vlen_t byte_idx, int NrLanes, rvv_pkg::vew_e ew);
+  function automatic logic [$clog2(8*MaxNrLanes)-1:0] shuffle_index(logic[15:0] byte_idx, int NrLanes, rvv_pkg::vew_e ew);
     // Generate the shuffling of the table above
     unique case (NrLanes)
       1: unique case (ew)
           rvv_pkg::EW64: begin
-            automatic vlen_t [7:0] idx;
+            automatic logic [$clog2(8)-1:0] idx [7:0];
             idx[7] = 7; idx[6] = 6; idx[5] = 5; idx[4] = 4;
             idx[3] = 3; idx[2] = 2; idx[1] = 1; idx[0] = 0;
             return idx[byte_idx[2:0]];
           end
           rvv_pkg::EW32: begin
-            automatic vlen_t [7:0] idx;
+            automatic logic [$clog2(8)-1:0] idx [7:0];
             idx[7] = 7; idx[6] = 6; idx[5] = 5; idx[4] = 4;
             idx[3] = 3; idx[2] = 2; idx[1] = 1; idx[0] = 0;
             return idx[byte_idx[2:0]];
           end
           rvv_pkg::EW16: begin
-            automatic vlen_t [7:0] idx;
+            automatic logic [$clog2(8)-1:0] idx [7:0];
             idx[7] = 7; idx[6] = 6; idx[5] = 3; idx[4] = 2;
             idx[3] = 5; idx[2] = 4; idx[1] = 1; idx[0] = 0;
             return idx[byte_idx[2:0]];
           end
           rvv_pkg::EW8: begin
-            automatic vlen_t [7:0] idx;
+            automatic logic [$clog2(8)-1:0] idx [7:0];
             idx[7] = 7; idx[6] = 3; idx[5] = 5; idx[4] = 1;
             idx[3] = 6; idx[2] = 2; idx[1] = 4; idx[0] = 0;
             return idx[byte_idx[2:0]];
           end
           default: begin
-            automatic vlen_t [7:0] idx;
+            automatic logic [$clog2(8)-1:0] idx [7:0];
             idx[7] = 7; idx[6] = 6; idx[5] = 5; idx[4] = 4;
             idx[3] = 3; idx[2] = 2; idx[1] = 1; idx[0] = 0;
             return idx[byte_idx[2:0]];
@@ -485,7 +383,7 @@ package ara_pkg;
         endcase
       2: unique case (ew)
           rvv_pkg::EW64: begin
-            automatic vlen_t [15:0] idx;
+            automatic logic [$clog2(16)-1:0] idx [15:0];
             idx[15] = 15; idx[14] = 14; idx[13] = 13; idx[12] = 12;
             idx[11] = 11; idx[10] = 10; idx[09] = 09; idx[08] = 08;
             idx[07] = 07; idx[06] = 06; idx[05] = 05; idx[04] = 04;
@@ -493,7 +391,7 @@ package ara_pkg;
             return idx[byte_idx[3:0]];
           end
           rvv_pkg::EW32: begin
-            automatic vlen_t [15:0] idx;
+            automatic logic [$clog2(16)-1:0] idx [15:0];
             idx[15] = 15; idx[14] = 14; idx[13] = 13; idx[12] = 12;
             idx[11] = 07; idx[10] = 06; idx[09] = 05; idx[08] = 04;
             idx[07] = 11; idx[06] = 10; idx[05] = 09; idx[04] = 08;
@@ -501,7 +399,7 @@ package ara_pkg;
             return idx[byte_idx[3:0]];
           end
           rvv_pkg::EW16: begin
-            automatic vlen_t [15:0] idx;
+            automatic logic [$clog2(16)-1:0] idx [15:0];
             idx[15] = 15; idx[14] = 14; idx[13] = 07; idx[12] = 06;
             idx[11] = 11; idx[10] = 10; idx[09] = 03; idx[08] = 02;
             idx[07] = 13; idx[06] = 12; idx[05] = 05; idx[04] = 04;
@@ -509,7 +407,7 @@ package ara_pkg;
             return idx[byte_idx[3:0]];
           end
           rvv_pkg::EW8: begin
-            automatic vlen_t [15:0] idx;
+            automatic logic [$clog2(16)-1:0] idx [15:0];
             idx[15] = 15; idx[14] = 07; idx[13] = 11; idx[12] = 03;
             idx[11] = 13; idx[10] = 05; idx[09] = 09; idx[08] = 01;
             idx[07] = 14; idx[06] = 06; idx[05] = 10; idx[04] = 02;
@@ -517,7 +415,7 @@ package ara_pkg;
             return idx[byte_idx[3:0]];
           end
           default: begin
-            automatic vlen_t [15:0] idx;
+            automatic logic [$clog2(16)-1:0] idx [15:0];
             idx[15] = 15; idx[14] = 14; idx[13] = 13; idx[12] = 12;
             idx[11] = 11; idx[10] = 10; idx[09] = 09; idx[08] = 08;
             idx[07] = 07; idx[06] = 06; idx[05] = 05; idx[04] = 04;
@@ -527,7 +425,7 @@ package ara_pkg;
         endcase
       4: unique case (ew)
           rvv_pkg::EW64: begin
-            automatic vlen_t [31:0] idx;
+            automatic logic [$clog2(32)-1:0] idx [31:0];
             idx[31] = 31; idx[30] = 30; idx[29] = 29; idx[28] = 28;
             idx[27] = 27; idx[26] = 26; idx[25] = 25; idx[24] = 24;
             idx[23] = 23; idx[22] = 22; idx[21] = 21; idx[20] = 20;
@@ -539,7 +437,7 @@ package ara_pkg;
             return idx[byte_idx[4:0]];
           end
           rvv_pkg::EW32: begin
-            automatic vlen_t [31:0] idx;
+            automatic logic [$clog2(32)-1:0] idx [31:0];
             idx[31] = 31; idx[30] = 30; idx[29] = 29; idx[28] = 28;
             idx[27] = 23; idx[26] = 22; idx[25] = 21; idx[24] = 20;
             idx[23] = 15; idx[22] = 14; idx[21] = 13; idx[20] = 12;
@@ -551,7 +449,7 @@ package ara_pkg;
             return idx[byte_idx[4:0]];
           end
           rvv_pkg::EW16: begin
-            automatic vlen_t [31:0] idx;
+            automatic logic [$clog2(32)-1:0] idx [31:0];
             idx[31] = 31; idx[30] = 30; idx[29] = 23; idx[28] = 22;
             idx[27] = 15; idx[26] = 14; idx[25] = 07; idx[24] = 06;
             idx[23] = 27; idx[22] = 26; idx[21] = 19; idx[20] = 18;
@@ -563,7 +461,7 @@ package ara_pkg;
             return idx[byte_idx[4:0]];
           end
           rvv_pkg::EW8: begin
-            automatic vlen_t [31:0] idx;
+            automatic logic [$clog2(32)-1:0] idx [31:0];
             idx[31] = 31; idx[30] = 23; idx[29] = 15; idx[28] = 07;
             idx[27] = 27; idx[26] = 19; idx[25] = 11; idx[24] = 03;
             idx[23] = 29; idx[22] = 21; idx[21] = 13; idx[20] = 05;
@@ -575,7 +473,7 @@ package ara_pkg;
             return idx[byte_idx[4:0]];
           end
           default: begin
-            automatic vlen_t [31:0] idx;
+            automatic logic [$clog2(32)-1:0] idx [31:0];
             idx[31] = 31; idx[30] = 30; idx[29] = 29; idx[28] = 28;
             idx[27] = 27; idx[26] = 26; idx[25] = 25; idx[24] = 24;
             idx[23] = 23; idx[22] = 22; idx[21] = 21; idx[20] = 20;
@@ -589,7 +487,7 @@ package ara_pkg;
         endcase
       8: unique case (ew)
           rvv_pkg::EW64: begin
-            automatic vlen_t [63:0] idx;
+            automatic logic [$clog2(64)-1:0] idx [63:0];
             idx[63] = 63; idx[62] = 62; idx[61] = 61; idx[60] = 60;
             idx[59] = 59; idx[58] = 58; idx[57] = 57; idx[56] = 56;
             idx[55] = 55; idx[54] = 54; idx[53] = 53; idx[52] = 52;
@@ -609,7 +507,7 @@ package ara_pkg;
             return idx[byte_idx[5:0]];
           end
           rvv_pkg::EW32: begin
-            automatic vlen_t [63:0] idx;
+            automatic logic [$clog2(64)-1:0] idx [63:0];
             idx[63] = 63; idx[62] = 62; idx[61] = 61; idx[60] = 60;
             idx[59] = 55; idx[58] = 54; idx[57] = 53; idx[56] = 52;
             idx[55] = 47; idx[54] = 46; idx[53] = 45; idx[52] = 44;
@@ -629,7 +527,7 @@ package ara_pkg;
             return idx[byte_idx[5:0]];
           end
           rvv_pkg::EW16: begin
-            automatic vlen_t [63:0] idx;
+            automatic logic [$clog2(64)-1:0] idx [63:0];
             idx[63] = 63; idx[62] = 62; idx[61] = 55; idx[60] = 54;
             idx[59] = 47; idx[58] = 46; idx[57] = 39; idx[56] = 38;
             idx[55] = 31; idx[54] = 30; idx[53] = 23; idx[52] = 22;
@@ -649,7 +547,7 @@ package ara_pkg;
             return idx[byte_idx[5:0]];
           end
           rvv_pkg::EW8: begin
-            automatic vlen_t [63:0] idx;
+            automatic logic [$clog2(64)-1:0] idx [63:0];
             idx[63] = 63; idx[62] = 55; idx[61] = 47; idx[60] = 39;
             idx[59] = 31; idx[58] = 23; idx[57] = 15; idx[56] = 07;
             idx[55] = 59; idx[54] = 51; idx[53] = 43; idx[52] = 35;
@@ -669,7 +567,7 @@ package ara_pkg;
             return idx[byte_idx[5:0]];
           end
           default: begin
-            automatic vlen_t [63:0] idx;
+            automatic logic [$clog2(64)-1:0] idx [63:0];
             idx[63] = 63; idx[62] = 62; idx[61] = 61; idx[60] = 60;
             idx[59] = 59; idx[58] = 58; idx[57] = 57; idx[56] = 56;
             idx[55] = 55; idx[54] = 54; idx[53] = 53; idx[52] = 52;
@@ -691,7 +589,7 @@ package ara_pkg;
         endcase
       16: unique case (ew)
           rvv_pkg::EW64: begin
-            automatic vlen_t [127:0] idx;
+            automatic logic [$clog2(128)-1:0] idx [127:0];
             idx[127] = 127; idx[126] = 126; idx[125] = 125; idx[124] = 124;
             idx[123] = 123; idx[122] = 122; idx[121] = 121; idx[120] = 120;
             idx[119] = 119; idx[118] = 118; idx[117] = 117; idx[116] = 116;
@@ -727,7 +625,7 @@ package ara_pkg;
             return idx[byte_idx[6:0]];
           end
           rvv_pkg::EW32: begin
-            automatic vlen_t [127:0] idx;
+            automatic logic [$clog2(128)-1:0] idx [127:0];
             idx[127] = 127; idx[126] = 126; idx[125] = 125; idx[124] = 124;
             idx[123] = 119; idx[122] = 118; idx[121] = 117; idx[120] = 116;
             idx[119] = 111; idx[118] = 110; idx[117] = 109; idx[116] = 108;
@@ -763,7 +661,7 @@ package ara_pkg;
             return idx[byte_idx[6:0]];
           end
           rvv_pkg::EW16: begin
-            automatic vlen_t [127:0] idx;
+            automatic logic [$clog2(128)-1:0] idx [127:0];
             idx[127] = 127; idx[126] = 126; idx[125] = 119; idx[124] = 118;
             idx[123] = 111; idx[122] = 110; idx[121] = 103; idx[120] = 102;
             idx[119] = 095; idx[118] = 094; idx[117] = 087; idx[116] = 086;
@@ -799,7 +697,7 @@ package ara_pkg;
             return idx[byte_idx[6:0]];
           end
           rvv_pkg::EW8: begin
-            automatic vlen_t [127:0] idx;
+            automatic logic [$clog2(128)-1:0] idx [127:0];
             idx[127] = 127; idx[126] = 119; idx[125] = 111; idx[124] = 103;
             idx[123] = 095; idx[122] = 087; idx[121] = 079; idx[120] = 071;
             idx[119] = 063; idx[118] = 055; idx[117] = 047; idx[116] = 039;
@@ -835,7 +733,7 @@ package ara_pkg;
             return idx[byte_idx[6:0]];
           end
           default: begin
-            automatic vlen_t [127:0] idx;
+            automatic logic [$clog2(128)-1:0] idx [127:0];
             idx[127] = 127; idx[126] = 126; idx[125] = 125; idx[124] = 124;
             idx[123] = 123; idx[122] = 122; idx[121] = 121; idx[120] = 120;
             idx[119] = 119; idx[118] = 118; idx[117] = 117; idx[116] = 116;
@@ -874,23 +772,23 @@ package ara_pkg;
       default: $error("Error. Supported number of lanes are 1, 2, 4, 8, 16.");
     endcase
 
-  /*automatic vlen_t [8*MaxNrLanes-1:0] element_shuffle_index;
+  /*automatic logic [$clog2(ELENB*NrLanes)-1:0] [8*MaxNrLanes-1:0] element_shuffle_index;
 
    unique case (ew)
    rvv_pkg::EW64:
-   for (vlen_t element = 0; element < NrLanes; element++)
+   for (logic [$clog2(ELENB*NrLanes)-1:0] element = 0; element < NrLanes; element++)
    for (int b = 0; b < 8; b++)
    element_shuffle_index[8*(element >> 0) + b] = 8*element + b;
    rvv_pkg::EW32:
-   for (vlen_t element = 0; element < 2*NrLanes; element++)
+   for (logic [$clog2(ELENB*NrLanes)-1:0] element = 0; element < 2*NrLanes; element++)
    for (int b = 0; b < 4; b++)
    element_shuffle_index[4*((element >> 1) + int'(element[0]) * NrLanes*1) + b] = 4*element + b;
    rvv_pkg::EW16:
-   for (vlen_t element = 0; element < 4*NrLanes; element++)
+   for (logic [$clog2(ELENB*NrLanes)-1:0] element = 0; element < 4*NrLanes; element++)
    for (int b = 0; b < 2; b++)
    element_shuffle_index[2*((element >> 2) + int'(element[1]) * NrLanes*1 + int'(element[0]) * NrLanes*2) + b] = 2*element + b;
    rvv_pkg::EW8:
-   for (vlen_t element = 0; element < 8*NrLanes; element++)
+   for (logic [$clog2(ELENB*NrLanes)-1:0] element = 0; element < 8*NrLanes; element++)
    for (int b = 0; b < 1; b++)
    element_shuffle_index[1*((element >> 3) + int'(element[2]) * NrLanes*1 + int'(element[1]) * NrLanes*2 + int'(element[0]) * NrLanes*4) + b] = 1*element + b;
    default:;
@@ -899,41 +797,41 @@ package ara_pkg;
    return element_shuffle_index[byte_index];*/
   endfunction : shuffle_index
 
-  function automatic vlen_t deshuffle_index(vlen_t byte_index, int NrLanes, rvv_pkg::vew_e ew);
+  function automatic logic [$clog2(8*MaxNrLanes)-1:0] deshuffle_index(logic[15:0] byte_index, int NrLanes, rvv_pkg::vew_e ew);
     // Generate the deshuffling of the table above
     unique case (NrLanes)
       1: begin
-        automatic vlen_t [7:0] index;
+        automatic logic [$clog2(8)-1:0] index [7:0];
         for (int b = 0; b < 8; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[2:0]];
       end
       2: begin
-        automatic vlen_t [15:0] index;
+        automatic logic [$clog2(16)-1:0] index [15:0];
         for (int b = 0; b < 16; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[3:0]];
       end
       4: begin
-        automatic vlen_t [31:0] index;
+        automatic logic [$clog2(32)-1:0] index [31:0];
         for (int b = 0; b < 32; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[4:0]];
       end
       8: begin
-        automatic vlen_t [63:0] index;
+        automatic logic [$clog2(64)-1:0] index [63:0];
         for (int b = 0; b < 64; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[5:0]];
       end
       16: begin
-        automatic vlen_t [127:0] index;
+        automatic logic [$clog2(128)-1:0] index [127:0];
         for (int b = 0; b < 128; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[6:0]];
       end
       default: begin
-        automatic vlen_t [31:0] index;
+        automatic logic [$clog2(32)-1:0] index [31:0];
         for (int b = 0; b < 32; b++)
           index[shuffle_index(b, NrLanes, ew)] = b;
         return index[byte_index[4:0]];
@@ -976,11 +874,21 @@ package ara_pkg;
   } opqueue_e;
 
   // Each lane has eight VRF banks
+  // NOTE: values != 8 are not supported
   localparam int unsigned NrVRFBanksPerLane = 8;
 
-  // Find the starting address of a vector register vid
-  function automatic logic [63:0] vaddr(logic [4:0] vid, int NrLanes);
-    vaddr = vid * (VLENB / NrLanes / 8);
+  // Find the starting address (in bytes) of a vector register chunk of vid
+  function automatic logic [63:0] vaddr(logic [4:0] vid, int NrLanes, int vlen);
+    int vlenb = vlen / 8;
+    // Each vector register spans multiple words in each bank in each lane
+    // The start address is the same in every lane
+    // Therefore, within each lane, each vector register chunk starts on a given offset
+    vaddr = vid * (vlenb / NrLanes / NrVRFBanksPerLane);
+    // NOTE: the only extensively tested configuration of Ara keeps:
+    //        - (VLEN / NrLanes) constant to 1024;
+    //        - NrVRFBanksPerLane always equal to 8.
+    //        Given so, each vector register will span 2 words across all the banks and lanes,
+    //        therefore, vaddr = vid * 16
   endfunction: vaddr
 
   // Differenciate between SLDU and ADDRGEN operands from opqueue
@@ -988,73 +896,6 @@ package ara_pkg;
     ALU_SLDU     = 1'b0,
     MFPU_ADDRGEN = 1'b1
   } target_fu_e;
-
-  // This is the interface between the lane's sequencer and the operand request stage, which
-  // makes consecutive requests to the vector elements inside the VRF.
-  typedef struct packed {
-    vid_t id; // ID of the vector instruction
-
-    logic [4:0] vs; // Vector register operand
-
-    logic scale_vl; // Rescale vl taking into account the new and old EEW
-
-    resize_e cvt_resize;    // Resizing of FP conversions
-
-    logic is_reduct; // Is this a reduction?
-
-    rvv_pkg::vew_e eew;        // Effective element width
-    opqueue_conversion_e conv; // Type conversion
-
-    target_fu_e target_fu;     // Target FU of the opqueue (if it is not clear)
-
-    // Vector machine metadata
-    rvv_pkg::vtype_t vtype;
-    vlen_t vl;
-    vlen_t vstart;
-
-    // Hazards
-    logic [NrVInsn-1:0] hazard;
-  } operand_request_cmd_t;
-
-  typedef struct packed {
-    rvv_pkg::vew_e eew;        // Effective element width
-    vlen_t vl;                 // Vector length
-    opqueue_conversion_e conv; // Type conversion
-    logic [1:0] ntr_red;       // Neutral type for reductions
-    logic is_reduct;           // Is this a reduction?
-    target_fu_e target_fu;     // Target FU of the opqueue (if it is not clear)
-  } operand_queue_cmd_t;
-
-  // This is the interface between the lane's sequencer and the lane's VFUs.
-  typedef struct packed {
-    vid_t id; // ID of the vector instruction
-
-    ara_op_e op; // Operation
-    logic vm;    // Masked instruction
-
-    logic use_vs1;   // This operation uses vs1
-    logic use_vs2;   // This operation uses vs1
-    logic use_vd_op; // This operation uses vd as an operand as well
-
-    elen_t scalar_op;    // Scalar operand
-    logic use_scalar_op; // This operation uses the scalar operand
-
-    vfu_e vfu; // VFU responsible for this instruction
-
-    logic [4:0] vd; // Vector destination register
-    logic use_vd;
-
-    logic swap_vs2_vd_op; // If asserted: vs2 is kept in MulFPU opqueue C, and vd_op in MulFPU A
-
-    fpnew_pkg::roundmode_e fp_rm; // Rounding-Mode for FP operations
-    logic wide_fp_imm;            // Widen FP immediate (re-encoding)
-    resize_e cvt_resize;    // Resizing of FP conversions
-
-    // Vector machine metadata
-    vlen_t vl;
-    vlen_t vstart;
-    rvv_pkg::vtype_t vtype;
-  } vfu_operation_t;
 
   // Due to the shuffled nature of the vector elements inside one lane, the byte enable
   // signal must be generated differently depending on how many valid elements are there.
@@ -1105,6 +946,7 @@ package ara_pkg;
     axi_pkg::size_t size;
     axi_pkg::len_t len;
     logic is_load;
+    logic is_exception;
   } addrgen_axi_req_t;
 
 
@@ -2038,5 +1880,15 @@ package ara_pkg;
     endcase
     return vfrsqrt7_o;
   endfunction : vfrsqrt7_fp64
+
+  ////////////////
+  // Exceptions //
+  ////////////////
+
+  // End-to-end store exception latency, i.e.,
+  // the latency from the addrgen store exception to the opqueues.
+  // We keep it as a define to implement conditional declaration.
+  `define StuExLat 1
+  localparam int unsigned StuExLat = `StuExLat;
 
 endpackage : ara_pkg

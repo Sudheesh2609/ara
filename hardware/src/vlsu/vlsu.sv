@@ -9,8 +9,11 @@
 // and coherence with Ariane's own load/store unit.
 
 module vlsu import ara_pkg::*; import rvv_pkg::*; #(
-    parameter  int  unsigned NrLanes = 0,
-    parameter  type          vaddr_t = logic,  // Type used to address vector register file elements
+    parameter  int  unsigned NrLanes   = 0,
+    parameter  int  unsigned VLEN      = 0,
+    parameter  type          vaddr_t   = logic,  // Type used to address vector register file elements
+    parameter  type          pe_req_t  = logic,
+    parameter  type          pe_resp_t = logic,
     // AXI Interface parameters
     parameter  int  unsigned AxiDataWidth = 0,
     parameter  int  unsigned AxiAddrWidth = 0,
@@ -23,7 +26,8 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     parameter  type          axi_resp_t   = logic,
     // Dependant parameters. DO NOT CHANGE!
     localparam int  unsigned DataWidth    = $bits(elen_t),
-    localparam type          strb_t       = logic [DataWidth/8-1:0]
+    localparam type          strb_t       = logic [DataWidth/8-1:0],
+    localparam type          vlen_t       = logic[$clog2(VLEN+1)-1:0]
   ) (
     input  logic                    clk_i,
     input  logic                    rst_ni,
@@ -42,13 +46,14 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     output logic      [1:0]         pe_req_ready_o,         // Load (0) and Store (1) units
     output pe_resp_t  [1:0]         pe_resp_o,              // Load (0) and Store (1) units
     output logic                    addrgen_ack_o,
-    output logic                    addrgen_error_o,
-    output vlen_t                   addrgen_error_vl_o,
+    output ariane_pkg::exception_t  addrgen_exception_o,
+    output vlen_t                   addrgen_exception_vstart_o,
     // Interface with the lanes
     // Store unit operands
     input  elen_t     [NrLanes-1:0] stu_operand_i,
     input  logic      [NrLanes-1:0] stu_operand_valid_i,
     output logic      [NrLanes-1:0] stu_operand_ready_o,
+    output logic                    stu_exception_flush_o,
     // Address generation operands
     input  elen_t     [NrLanes-1:0] addrgen_operand_i,
     input  target_fu_e[NrLanes-1:0] addrgen_operand_target_fu_i,
@@ -59,6 +64,25 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     input  logic      [NrLanes-1:0] mask_valid_i,
     output logic                    vldu_mask_ready_o,
     output logic                    vstu_mask_ready_o,
+
+    // CSR input
+    input  logic                    en_ld_st_translation_i,
+
+    // Interface with CVA6's sv39 MMU
+    // This is everything the MMU can provide, it might be overcomplete for Ara and some signals be useless
+    output  logic                          mmu_misaligned_ex_o,
+    output  logic                          mmu_req_o,        // request address translation
+    output  logic [riscv::VLEN-1:0]        mmu_vaddr_o,      // virtual address out
+    output  logic                          mmu_is_store_o,   // the translation is requested by a store
+    // if we need to walk the page table we can't grant in the same cycle
+    // Cycle 0
+    input logic                            mmu_dtlb_hit_i,   // sent in the same cycle as the request if translation hits in the DTLB
+    input logic [riscv::PPNW-1:0]          mmu_dtlb_ppn_i,   // ppn (send same cycle as hit)
+    // Cycle 1
+    input logic                            mmu_valid_i,      // translation is valid
+    input logic [riscv::PLEN-1:0]          mmu_paddr_i,      // translated address
+    input ariane_pkg::exception_t          mmu_exception_i,  // address translation threw an exception
+
     // Results
     output logic      [NrLanes-1:0] ldu_result_req_o,
     output vid_t      [NrLanes-1:0] ldu_result_id_o,
@@ -68,6 +92,11 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     input  logic      [NrLanes-1:0] ldu_result_gnt_i,
     input  logic      [NrLanes-1:0] ldu_result_final_gnt_i
   );
+
+  logic load_complete, store_complete;
+  logic addrgen_illegal_load, addrgen_illegal_store;
+  assign load_complete_o  = load_complete;
+  assign store_complete_o = store_complete;
 
   ///////////////////
   //  Definitions  //
@@ -112,10 +141,13 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
 
   addrgen #(
     .NrLanes     (NrLanes     ),
+    .VLEN        (VLEN        ),
     .AxiDataWidth(AxiDataWidth),
     .AxiAddrWidth(AxiAddrWidth),
     .axi_ar_t    (axi_ar_t    ),
-    .axi_aw_t    (axi_aw_t    )
+    .axi_aw_t    (axi_aw_t    ),
+    .pe_req_t    (pe_req_t    ),
+    .pe_resp_t   (pe_resp_t   )
   ) i_addrgen (
     .clk_i                      (clk_i                      ),
     .rst_ni                     (rst_ni                     ),
@@ -133,8 +165,10 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .pe_req_valid_i             (pe_req_valid_i             ),
     .pe_vinsn_running_i         (pe_vinsn_running_i         ),
     .addrgen_ack_o              (addrgen_ack_o              ),
-    .addrgen_error_o            (addrgen_error_o            ),
-    .addrgen_error_vl_o         (addrgen_error_vl_o         ),
+    .addrgen_exception_o        ( addrgen_exception_o       ),
+    .addrgen_exception_vstart_o ( addrgen_exception_vstart_o),
+    .addrgen_illegal_load_o     (addrgen_illegal_load       ),
+    .addrgen_illegal_store_o    (addrgen_illegal_store      ),
     // Interface with the lanes
     .addrgen_operand_i          (addrgen_operand_i          ),
     .addrgen_operand_target_fu_i(addrgen_operand_target_fu_i),
@@ -144,7 +178,19 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_addrgen_req_o          (axi_addrgen_req            ),
     .axi_addrgen_req_valid_o    (axi_addrgen_req_valid      ),
     .ldu_axi_addrgen_req_ready_i(ldu_axi_addrgen_req_ready  ),
-    .stu_axi_addrgen_req_ready_i(stu_axi_addrgen_req_ready  )
+    .stu_axi_addrgen_req_ready_i(stu_axi_addrgen_req_ready  ),
+
+    // CSR input
+    .en_ld_st_translation_i,
+    .mmu_misaligned_ex_o,
+    .mmu_req_o,
+    .mmu_vaddr_o,
+    .mmu_is_store_o,
+    .mmu_dtlb_hit_i,
+    .mmu_dtlb_ppn_i,
+    .mmu_valid_i,
+    .mmu_paddr_i,
+    .mmu_exception_i
   );
 
   ////////////////////////
@@ -156,7 +202,10 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .AxiDataWidth(AxiDataWidth),
     .axi_r_t     (axi_r_t     ),
     .NrLanes     (NrLanes     ),
-    .vaddr_t     (vaddr_t     )
+    .VLEN        (VLEN        ),
+    .vaddr_t     (vaddr_t     ),
+    .pe_req_t    (pe_req_t    ),
+    .pe_resp_t   (pe_resp_t   )
   ) i_vldu (
     .clk_i                  (clk_i                     ),
     .rst_ni                 (rst_ni                    ),
@@ -165,7 +214,7 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_r_valid_i          (axi_resp.r_valid          ),
     .axi_r_ready_o          (axi_req.r_ready           ),
     // Interface with the dispatcher
-    .load_complete_o        (load_complete_o           ),
+    .load_complete_o        (load_complete             ),
     // Interface with the main sequencer
     .pe_req_i               (pe_req_i                  ),
     .pe_req_valid_i         (pe_req_valid_i            ),
@@ -176,6 +225,7 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_addrgen_req_i      (axi_addrgen_req           ),
     .axi_addrgen_req_valid_i(axi_addrgen_req_valid     ),
     .axi_addrgen_req_ready_o(ldu_axi_addrgen_req_ready ),
+    .addrgen_illegal_load_i (addrgen_illegal_load      ),
     // Interface with the Mask unit
     .mask_i                 (mask_i                    ),
     .mask_valid_i           (mask_valid_i              ),
@@ -200,7 +250,10 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_w_t     (axi_w_t     ),
     .axi_b_t     (axi_b_t     ),
     .NrLanes     (NrLanes     ),
-    .vaddr_t     (vaddr_t     )
+    .VLEN        (VLEN        ),
+    .vaddr_t     (vaddr_t     ),
+    .pe_req_t    (pe_req_t    ),
+    .pe_resp_t   (pe_resp_t   )
   ) i_vstu (
     .clk_i                  (clk_i                      ),
     .rst_ni                 (rst_ni                     ),
@@ -213,7 +266,7 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_b_ready_o          (axi_req.b_ready            ),
     // Interface with the dispatcher
     .store_pending_o        (store_pending_o            ),
-    .store_complete_o       (store_complete_o           ),
+    .store_complete_o       (store_complete             ),
     // Interface with the main sequencer
     .pe_req_i               (pe_req_i                   ),
     .pe_req_valid_i         (pe_req_valid_i             ),
@@ -224,6 +277,7 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     .axi_addrgen_req_i      (axi_addrgen_req            ),
     .axi_addrgen_req_valid_i(axi_addrgen_req_valid      ),
     .axi_addrgen_req_ready_o(stu_axi_addrgen_req_ready  ),
+    .addrgen_illegal_store_i(addrgen_illegal_store      ),
     // Interface with the Mask unit
     .mask_i                 (mask_i                     ),
     .mask_valid_i           (mask_valid_i               ),
@@ -231,7 +285,8 @@ module vlsu import ara_pkg::*; import rvv_pkg::*; #(
     // Interface with the lanes
     .stu_operand_i          (stu_operand_i              ),
     .stu_operand_valid_i    (stu_operand_valid_i        ),
-    .stu_operand_ready_o    (stu_operand_ready_o        )
+    .stu_operand_ready_o    (stu_operand_ready_o        ),
+    .stu_exception_flush_o  (stu_exception_flush_o      )
   );
 
   //////////////////

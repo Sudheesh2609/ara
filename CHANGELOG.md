@@ -11,12 +11,29 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
  - Fix dump vtrace script for vsetvli instructions without x0 (ideal dispatcher)
  - Fix Pathfinder and FFT performance
+ - Stall Ara and wait for ara_idle upon CSR write/read
+ - Fix how VLSU reports exceptions
+ - Set vstart=0 upon succesfull vector instructions
+ - Fix vstart usage in ara dispatcher
+ - Fix reshuffle mechanism
+ - Fix vstart usage for memory operations
+ - Fix fft, exp, softmax, roi_align performance
+ - Fix printf bug (missing characters) - UART and CTRL memory regions are now idempotent
+ - Start int reductions only if ALU result queue is empty
+ - Fix `acc_dispatcher` CVA6 bug for instructions with side effects
+ - Fix NaN/subnormal floating-point handling in opqueues
+ - Stall vfdiv/vfsqrt instructions following/preceding other fp instructions
 
 ### Added
 
  - Plot kernels-Vl performance plot
  - Print I$/D$ stall metrics
  - Add `spmv`, `conjugate_gradient`, and `gemv` kernels.
+ - Add multi-precision matmul kernel
+ - Add MMU interface between Ara and CVA6
+ - Add virtual->physical address translation for Ara by sharing CVA6 MMU
+ - Add Ara VLSU support for MMU exceptions
+ - Add multi-precision conv3d
 
 ### Changed
 
@@ -30,6 +47,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
  - [f]dotproduct works on the vector length in elements
  - Optimize DWT
  - Fix pathfinder performance
+ - Rename CSRs in dispatcher to improve clarity
+ - Change from reporting "errors" to full "exceptions"
+ - Bump CVA6 to version that supports "exceptions" reporting
+ - VLEN is now a parameter of the ara architecture and does not depend on a define anymore
+ - vlen_t, as a consequence, is now define within the architecture as a parameter/localparam
+ - Refactor addrgen module
+ - Memory size is now constant with NrLanes
+ - Enable hierarchical verilation
+ - Bump AXI and common cells to solve verilation warnings
 
 ## 3.0.0 - 2023-09-08
 

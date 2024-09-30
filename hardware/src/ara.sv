@@ -9,6 +9,7 @@
 module ara import ara_pkg::*; #(
     // RVV Parameters
     parameter  int           unsigned NrLanes      = 0,                          // Number of parallel vector lanes.
+    parameter  int           unsigned VLEN         = 0,                          // VLEN [bit]
     // Support for floating-point data types
     parameter  fpu_support_e          FPUSupport   = FPUSupportHalfSingleDouble,
     // External support for vfrec7, vfrsqrt7
@@ -28,7 +29,9 @@ module ara import ara_pkg::*; #(
     // Dependant parameters. DO NOT CHANGE!
     // Ara has NrLanes + 3 processing elements: each one of the lanes, the vector load unit, the
     // vector store unit, the slide unit, and the mask unit.
-    localparam int           unsigned NrPEs        = NrLanes + 4
+    localparam int           unsigned NrPEs        = NrLanes + 4,
+    localparam type                   vlen_t       = logic[$clog2(VLEN+1)-1:0],
+    localparam int           unsigned VLENB        = VLEN / 8
   ) (
     // Clock and Reset
     input  logic              clk_i,
@@ -37,14 +40,16 @@ module ara import ara_pkg::*; #(
     input  logic              scan_enable_i,
     input  logic              scan_data_i,
     output logic              scan_data_o,
+
     // Interface with Ariane
-    input  accelerator_req_t  acc_req_i,
-    output accelerator_resp_t acc_resp_o,
+    input  cva6_to_acc_t      acc_req_i,
+    output acc_to_cva6_t      acc_resp_o,
     // AXI interface
     output axi_req_t          axi_req_o,
     input  axi_resp_t         axi_resp_i
   );
 
+  `include "ara/ara_typedef.svh"
   import cf_math_pkg::idx_width;
 
   ///////////////////
@@ -61,6 +66,89 @@ module ara import ara_pkg::*; #(
   localparam int unsigned DataWidth = $bits(elen_t);
   localparam int unsigned StrbWidth = DataWidth / 8;
   typedef logic [StrbWidth-1:0] strb_t;
+
+  // Interfaces between Ara's dispatcher and Ara's backend
+  typedef struct packed {
+    ara_op_e op; // Operation
+
+    // Stores and slides do not re-shuffle the
+    // source registers. In these two cases, vl refers
+    // to the target EEW and vtype.vsew, respectively.
+    // Since operand requesters work with the old
+    // eew of the source registers, we should rescale
+    // vl to the old eew to fetch the correct number of Bytes.
+    //
+    // Another solution would be to pass directly the target
+    // eew (vstores) or the vtype.vsew (vslides), but this would
+    // create confusion with the current naming convention
+    logic scale_vl;
+
+    // Mask vector register operand
+    logic vm;
+    rvv_pkg::vew_e eew_vmask;
+
+    // 1st vector register operand
+    logic [4:0] vs1;
+    logic use_vs1;
+    opqueue_conversion_e conversion_vs1;
+    rvv_pkg::vew_e eew_vs1;
+    rvv_pkg::vew_e old_eew_vs1;
+
+    // 2nd vector register operand
+    logic [4:0] vs2;
+    logic use_vs2;
+    opqueue_conversion_e conversion_vs2;
+    rvv_pkg::vew_e eew_vs2;
+
+    // Use vd as an operand as well (e.g., vmacc)
+    logic use_vd_op;
+    rvv_pkg::vew_e eew_vd_op;
+
+    // Scalar operand
+    elen_t scalar_op;
+    logic use_scalar_op;
+
+    // 2nd scalar operand: stride for constant-strided vector load/stores, slide offset for vector
+    // slides
+    elen_t stride;
+    logic is_stride_np2;
+
+    // Destination vector register
+    logic [4:0] vd;
+    logic use_vd;
+
+    // If asserted: vs2 is kept in MulFPU opqueue C, and vd_op in MulFPU A
+    logic swap_vs2_vd_op;
+
+    // Effective length multiplier
+    rvv_pkg::vlmul_e emul;
+
+    // Rounding-Mode for FP operations
+    fpnew_pkg::roundmode_e fp_rm;
+    // Widen FP immediate (re-encoding)
+    logic wide_fp_imm;
+    // Resizing of FP conversions
+    resize_e cvt_resize;
+
+    // Vector machine metadata
+    vlen_t vl;
+    vlen_t vstart;
+    rvv_pkg::vtype_t vtype;
+
+    // Request token, for registration in the sequencer
+    logic token;
+  } ara_req_t;
+
+  typedef struct packed {
+    // Scalar response
+    elen_t resp;
+
+    // Instruction triggered an exception
+    ariane_pkg::exception_t exception;
+
+    // New value for vstart
+    vlen_t exception_vstart;
+  } ara_resp_t;
 
   //////////////////
   //  Dispatcher  //
@@ -85,13 +173,16 @@ module ara import ara_pkg::*; #(
   vxrm_t     [NrLanes-1:0]      alu_vxrm;
 
   ara_dispatcher #(
-    .NrLanes(NrLanes)
+    .NrLanes   (NrLanes   ),
+    .VLEN      (VLEN      ),
+    .ara_req_t (ara_req_t ),
+    .ara_resp_t(ara_resp_t)
   ) i_dispatcher (
     .clk_i             (clk_i           ),
     .rst_ni            (rst_ni          ),
     // Interface with Ariane
-    .acc_req_i         (acc_req_i       ),
-    .acc_resp_o        (acc_resp_o      ),
+    .acc_req_i         (acc_req_i.acc_req  ),
+    .acc_resp_o        (acc_resp_o.acc_resp),
     // Interface with the sequencer
     .ara_req_o         (ara_req         ),
     .ara_req_valid_o   (ara_req_valid   ),
@@ -123,8 +214,8 @@ module ara import ara_pkg::*; #(
   pe_resp_t          [NrPEs-1:0]   pe_resp;
   // Interface with the address generator
   logic                            addrgen_ack;
-  logic                            addrgen_error;
-  vlen_t                           addrgen_error_vl;
+  ariane_pkg::exception_t          addrgen_exception;
+  vlen_t                           addrgen_exception_vstart;
   logic              [NrLanes-1:0] alu_vinsn_done;
   logic              [NrLanes-1:0] mfpu_vinsn_done;
   // Interface with the operand requesters
@@ -145,7 +236,14 @@ module ara import ara_pkg::*; #(
   elen_t     result_scalar;
   logic      result_scalar_valid;
 
-  ara_sequencer #(.NrLanes(NrLanes)) i_sequencer (
+  ara_sequencer #(
+    .NrLanes   (NrLanes   ),
+    .VLEN      (VLEN      ),
+    .ara_req_t (ara_req_t ),
+    .ara_resp_t(ara_resp_t),
+    .pe_req_t  (pe_req_t  ),
+    .pe_resp_t (pe_resp_t )
+  ) i_sequencer (
     .clk_i                 (clk_i                    ),
     .rst_ni                (rst_ni                   ),
     // Interface with the dispatcher
@@ -171,8 +269,8 @@ module ara import ara_pkg::*; #(
     .pe_scalar_resp_ready_o(pe_scalar_resp_ready     ),
     // Interface with the address generator
     .addrgen_ack_i         (addrgen_ack              ),
-    .addrgen_error_i       (addrgen_error            ),
-    .addrgen_error_vl_i    (addrgen_error_vl         )
+    .addrgen_exception_i   (addrgen_exception        ),
+    .addrgen_exception_vstart_i(addrgen_exception_vstart     )
   );
 
   // Scalar move support
@@ -191,6 +289,7 @@ module ara import ara_pkg::*; #(
   elen_t     [NrLanes-1:0]                     stu_operand;
   logic      [NrLanes-1:0]                     stu_operand_valid;
   logic      [NrLanes-1:0]                     stu_operand_ready;
+  logic                                        stu_exception_flush;
   // Slide unit/address generation operands
   elen_t     [NrLanes-1:0]                     sldu_addrgen_operand;
   target_fu_e[NrLanes-1:0]                     sldu_addrgen_operand_target_fu;
@@ -228,10 +327,13 @@ module ara import ara_pkg::*; #(
 
   for (genvar lane = 0; lane < NrLanes; lane++) begin: gen_lanes
     lane #(
-      .NrLanes     (NrLanes     ),
-      .FPUSupport  (FPUSupport  ),
-      .FPExtSupport(FPExtSupport),
-      .FixPtSupport(FixPtSupport)
+      .NrLanes              (NrLanes              ),
+      .VLEN                 (VLEN                 ),
+      .FPUSupport           (FPUSupport           ),
+      .FPExtSupport         (FPExtSupport         ),
+      .FixPtSupport         (FixPtSupport         ),
+      .pe_req_t_bits        ($bits(pe_req_t)      ),
+      .pe_resp_t_bits       ($bits(pe_resp_t)     )
     ) i_lane (
       .clk_i                           (clk_i                               ),
       .rst_ni                          (rst_ni                              ),
@@ -273,6 +375,7 @@ module ara import ara_pkg::*; #(
       .stu_operand_o                   (stu_operand[lane]                   ),
       .stu_operand_valid_o             (stu_operand_valid[lane]             ),
       .stu_operand_ready_i             (stu_operand_ready[lane]             ),
+      .stu_exception_flush_i           (stu_exception_flush                 ),
       // Interface with the slide/address generation unit
       .sldu_addrgen_operand_o          (sldu_addrgen_operand[lane]          ),
       .sldu_addrgen_operand_target_fu_o(sldu_addrgen_operand_target_fu[lane]),
@@ -309,6 +412,7 @@ module ara import ara_pkg::*; #(
 
   vlsu #(
     .NrLanes     (NrLanes     ),
+    .VLEN        (VLEN        ),
     .AxiDataWidth(AxiDataWidth),
     .AxiAddrWidth(AxiAddrWidth),
     .axi_ar_t    (axi_ar_t    ),
@@ -318,7 +422,9 @@ module ara import ara_pkg::*; #(
     .axi_b_t     (axi_b_t     ),
     .axi_req_t   (axi_req_t   ),
     .axi_resp_t  (axi_resp_t  ),
-    .vaddr_t     (vaddr_t     )
+    .vaddr_t     (vaddr_t     ),
+    .pe_req_t    (pe_req_t    ),
+    .pe_resp_t   (pe_resp_t   )
   ) i_vlsu (
     .clk_i                      (clk_i                                                 ),
     .rst_ni                     (rst_ni                                                ),
@@ -337,8 +443,8 @@ module ara import ara_pkg::*; #(
     .pe_req_ready_o             (pe_req_ready[NrLanes+OffsetStore : NrLanes+OffsetLoad]),
     .pe_resp_o                  (pe_resp[NrLanes+OffsetStore : NrLanes+OffsetLoad]     ),
     .addrgen_ack_o              (addrgen_ack                                           ),
-    .addrgen_error_o            (addrgen_error                                         ),
-    .addrgen_error_vl_o         (addrgen_error_vl                                      ),
+    .addrgen_exception_o        (addrgen_exception                                     ),
+    .addrgen_exception_vstart_o (addrgen_exception_vstart                              ),
     // Interface with the Mask unit
     .mask_i                     (mask                                                  ),
     .mask_valid_i               (mask_valid                                            ),
@@ -349,11 +455,24 @@ module ara import ara_pkg::*; #(
     .stu_operand_i              (stu_operand                                           ),
     .stu_operand_valid_i        (stu_operand_valid                                     ),
     .stu_operand_ready_o        (stu_operand_ready                                     ),
+    .stu_exception_flush_o      (stu_exception_flush                                   ),
     // Address Generation
     .addrgen_operand_i          (sldu_addrgen_operand                                  ),
     .addrgen_operand_target_fu_i(sldu_addrgen_operand_target_fu                        ),
     .addrgen_operand_valid_i    (sldu_addrgen_operand_valid                            ),
     .addrgen_operand_ready_o    (addrgen_operand_ready                                 ),
+    // CSR input
+    .en_ld_st_translation_i     (acc_req_i.acc_mmu_en                                  ),
+    // Interface with CVA6's sv39 MMU
+    .mmu_misaligned_ex_o        (acc_resp_o.acc_mmu_req.acc_mmu_misaligned_ex          ),
+    .mmu_req_o                  (acc_resp_o.acc_mmu_req.acc_mmu_req                    ),
+    .mmu_vaddr_o                (acc_resp_o.acc_mmu_req.acc_mmu_vaddr                  ),
+    .mmu_is_store_o             (acc_resp_o.acc_mmu_req.acc_mmu_is_store               ),
+    .mmu_dtlb_hit_i             (acc_req_i.acc_mmu_resp.acc_mmu_dtlb_hit               ),
+    .mmu_dtlb_ppn_i             (acc_req_i.acc_mmu_resp.acc_mmu_dtlb_ppn               ),
+    .mmu_valid_i                (acc_req_i.acc_mmu_resp.acc_mmu_valid                  ),
+    .mmu_paddr_i                (acc_req_i.acc_mmu_resp.acc_mmu_paddr                  ),
+    .mmu_exception_i            (acc_req_i.acc_mmu_resp.acc_mmu_exception              ),
     // Load unit
     .ldu_result_req_o           (ldu_result_req                                        ),
     .ldu_result_addr_o          (ldu_result_addr                                       ),
@@ -372,8 +491,11 @@ module ara import ara_pkg::*; #(
   logic sldu_mask_ready;
 
   sldu #(
-    .NrLanes(NrLanes),
-    .vaddr_t(vaddr_t)
+    .NrLanes  (NrLanes  ),
+    .VLEN     (VLEN     ),
+    .vaddr_t  (vaddr_t  ),
+    .pe_req_t (pe_req_t ),
+    .pe_resp_t(pe_resp_t)
   ) i_sldu (
     .clk_i                   (clk_i                            ),
     .rst_ni                  (rst_ni                           ),
@@ -408,8 +530,11 @@ module ara import ara_pkg::*; #(
   /////////////////
 
   masku #(
-    .NrLanes(NrLanes),
-    .vaddr_t(vaddr_t)
+    .NrLanes  (NrLanes  ),
+    .VLEN     (VLEN     ),
+    .vaddr_t  (vaddr_t  ),
+    .pe_req_t (pe_req_t ),
+    .pe_resp_t(pe_resp_t)
   ) i_masku (
     .clk_i                   (clk_i                           ),
     .rst_ni                  (rst_ni                          ),
@@ -455,15 +580,15 @@ module ara import ara_pkg::*; #(
   if (NrLanes > MaxNrLanes)
     $error("[ara] Ara supports at most MaxNrLanes lanes.");
 
-  if (ara_pkg::VLEN == 0)
+  if (VLEN == 0)
     $error("[ara] The vector length must be greater than zero.");
 
-  if (ara_pkg::VLEN < ELEN)
+  if (VLEN < ELEN)
     $error(
       "[ara] The vector length must be greater or equal than the maximum size of a single vector element"
     );
 
-  if (ara_pkg::VLEN != 2**$clog2(ara_pkg::VLEN))
+  if (VLEN != 2**$clog2(VLEN))
     $error("[ara] The vector length must be a power of two.");
 
 endmodule : ara
